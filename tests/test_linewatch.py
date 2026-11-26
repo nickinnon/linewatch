@@ -129,6 +129,68 @@ class Detect(unittest.TestCase):
         self.assertEqual(events, [])
 
 
+TRACEPATH = """ 1?: [LOCALHOST]                      pmtu 1500
+ 1:  192.168.0.1                                           0.555ms
+ 2:  172.29.152.1                                         12.600ms
+ 3:  72.129.27.226                                        11.081ms
+ 4:  72.129.19.122                                        12.038ms asymm  7
+     Too many hops: pmtu 1500
+"""
+TRACEROUTE = """traceroute to 1.1.1.1 (1.1.1.1), 8 hops max, 52 byte packets
+ 1  192.168.0.1  1.234 ms
+ 2  *
+ 3  72.129.27.226  11.081 ms
+"""
+TRACERT = """
+Tracing route to 1.1.1.1 over a maximum of 8 hops
+
+  1    <1 ms    <1 ms    <1 ms  192.168.0.1
+  2     9 ms     8 ms    10 ms  172.29.152.1
+  3     *        *        *     Request timed out.
+  4    11 ms    12 ms    11 ms  72.129.27.226
+"""
+ROUTE_PRINT = """===========================================================================
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0      10.8.0.1       10.8.0.5     50
+          0.0.0.0          0.0.0.0      192.168.0.1    192.168.0.208     25
+===========================================================================
+Persistent Routes:
+  Network Address          Netmask  Gateway Address  Metric
+          0.0.0.0          0.0.0.0      192.168.0.1  Default
+"""
+
+
+class Discovery(unittest.TestCase):
+    def test_tracepath(self):
+        self.assertEqual(lw.path_ips(TRACEPATH), ["192.168.0.1", "172.29.152.1", "72.129.27.226", "72.129.19.122"])
+
+    def test_traceroute(self):
+        self.assertEqual(lw.path_ips(TRACEROUTE), ["192.168.0.1", "72.129.27.226"])
+
+    def test_tracert(self):
+        self.assertEqual(lw.path_ips(TRACERT), ["192.168.0.1", "172.29.152.1", "72.129.27.226"])
+
+    def test_route_print_picks_lowest_metric(self):
+        self.assertEqual(lw.parse_route_print(ROUTE_PRINT), "192.168.0.1")
+
+    def test_route_print_empty(self):
+        self.assertIsNone(lw.parse_route_print(""))
+
+
+class Locking(unittest.TestCase):
+    def test_second_instance_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = lw.lock_file(d)
+            self.assertIsNotNone(first)
+            self.assertIsNone(lw.lock_file(d))
+            self.assertTrue(lw.is_running(d))
+            lw.unlock_file(first)
+            self.assertFalse(lw.is_running(d))
+
+
 class Outputs(unittest.TestCase):
     def test_event_files_are_written(self):
         spec = [OK] * 10 + [rtts(hop=LOST, cloudflare=LOST, google=LOST)] * 3 + [OK] * 40

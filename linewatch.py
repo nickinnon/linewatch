@@ -25,10 +25,13 @@ Counted in the summaries, never raised as events:
     mixed        any other partial combination
 
 A target counts as failed in a round when its reply is lost (no reply within
---timeout) or slower than --stall-ms. Standard library only; Linux and macOS
-(unprivileged ICMP sockets, no root needed).
+--timeout) or slower than --stall-ms.
 
-    linewatch.py run [options]          start monitoring (default command)
+Python 3.8+, standard library only, no admin/root rights. Linux and macOS use an
+unprivileged ICMP socket; Windows uses the IcmpSendEcho API.
+
+    linewatch.py [run] [options]        monitor (default command)
+    linewatch.py check                  quick test that pinging works on this machine
     linewatch.py compare DIR_A DIR_B    line up events from two homes
 """
 
@@ -37,6 +40,7 @@ import csv
 import datetime as dt
 import ipaddress
 import os
+import platform
 import re
 import select
 import shutil
@@ -48,7 +52,11 @@ import sys
 import time
 from collections import Counter, deque
 
-VERSION = "1.0"
+VERSION = "1.1"
+WINDOWS = sys.platform == "win32"
+LOCK_FILE = "linewatch.lock"
+STOP_FILE = "linewatch.stop"
+IPV4 = r"\d{1,3}(?:\.\d{1,3}){3}"
 MAGIC = b"LWv1"
 EVENT_CLASSES = ("lan", "line", "upstream", "wan")  # tie-break order
 NOISE_CLASSES = ("hop-only", "router-only", "single", "mixed")
@@ -73,6 +81,94 @@ def file_stamp(t):
     return dt.datetime.fromtimestamp(t).strftime("%Y-%m-%d_%H%M%S")
 
 
+# --------------------------------------------------------------------------- platform helpers
+
+def run_cmd(cmd, timeout=30):
+    """Run a command; return its stdout, or '' on any failure. No console window on Windows."""
+    kw = {}
+    if WINDOWS:
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                              timeout=timeout, **kw).stdout or ""
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def is_ipv4(s):
+    try:
+        ipaddress.IPv4Address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def lock_file(out_dir):
+    """Exclusively lock out_dir/linewatch.lock. Returns the open file, or None if another
+    linewatch already holds it."""
+    os.makedirs(out_dir, exist_ok=True)
+    f = open(os.path.join(out_dir, LOCK_FILE), "a+")
+    try:
+        if WINDOWS:
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except OSError:
+        f.close()
+        return None
+
+
+def unlock_file(f):
+    try:
+        if WINDOWS:
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    f.close()
+
+
+def is_running(out_dir):
+    f = lock_file(out_dir)
+    if f is None:
+        return True
+    unlock_file(f)
+    return False
+
+
+def clock_offset(server="time.cloudflare.com", timeout=3.0):
+    """SNTP query. Returns seconds to add to the local clock to match the server, or None."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        try:
+            t1 = time.time()
+            s.sendto(b"\x23" + bytes(47), (server, 123))
+            data, _ = s.recvfrom(48)
+            t4 = time.time()
+        finally:
+            s.close()
+
+        def ntp_time(o):
+            sec, frac = struct.unpack("!II", data[o:o + 8])
+            return sec - 2208988800 + frac / 2.0 ** 32
+
+        return ((ntp_time(32) - t1) + (ntp_time(40) - t4)) / 2
+    except (OSError, struct.error):
+        return None
+
+
+def describe_offset(off):
+    if off is None:
+        return "offset unknown"
+    return "%d ms %s time.cloudflare.com" % (round(abs(off) * 1000), "behind" if off > 0 else "ahead of")
+
+
 # --------------------------------------------------------------------------- ICMP
 
 def icmp_checksum(data):
@@ -84,102 +180,183 @@ def icmp_checksum(data):
     return ~s & 0xFFFF
 
 
-class Pinger:
-    """ICMP echo over an unprivileged datagram socket (Linux ping sockets, macOS)."""
-
-    def __init__(self, token):
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
-        except OSError as e:
-            sys.exit("linewatch: cannot open an unprivileged ICMP socket (%s).\n"
-                     "On Linux, allow it with: sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'" % e)
-        self.sock.setblocking(False)
-        self.token = token & 0xFFFF  # distinguishes our replies from other ICMP users
-
-    def fileno(self):
-        return self.sock.fileno()
-
-    def send(self, ip, rnd):
-        payload = MAGIC + struct.pack("!HQ", self.token, rnd) + bytes(22)
-        pkt = struct.pack("!BBHHH", 8, 0, 0, self.token, rnd & 0xFFFF) + payload
-        pkt = pkt[:2] + struct.pack("!H", icmp_checksum(pkt)) + pkt[4:]
-        try:
-            self.sock.sendto(pkt, (ip, 0))
-            return True
-        except OSError:
-            return False
-
-    def drain(self):
-        """Read every queued reply. Returns [(src_ip, round, monotonic_ns)]."""
-        out = []
-        while True:
-            try:
-                data, addr = self.sock.recvfrom(4096)
-            except (BlockingIOError, InterruptedError):
-                break
-            except OSError:
-                break
-            t = time.monotonic_ns()
-            if data and data[0] >> 4 == 4:  # macOS hands us the IP header too
-                data = data[(data[0] & 0x0F) * 4:]
-            if len(data) < 22 or data[0] != 0 or data[8:12] != MAGIC:
-                continue
-            token, rnd = struct.unpack("!HQ", data[12:22])
-            if token == self.token:
-                out.append((addr[0], rnd, t))
-        return out
+class PingerBase:
+    """send(ip, rnd) fires one echo request; wait(timeout) returns [(src_ip, rnd, rtt_ms)]."""
 
     def probe(self, ip, tries=3, wait=1.5):
         """True if ip answers at least one of `tries` echoes within `wait` seconds."""
         for i in range(tries):
             self.send(ip, (1 << 40) + i)
         end = time.monotonic() + wait
-        while time.monotonic() < end:
-            r, _, _ = select.select([self.sock], [], [], max(0.0, end - time.monotonic()))
-            if r and any(src == ip for src, _, _ in self.drain()):
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            if any(src == ip for src, _, _ in self.wait(left)):
                 return True
-        return False
+
+
+class SocketPinger(PingerBase):
+    """Linux and macOS: unprivileged ICMP datagram socket."""
+
+    def __init__(self, token):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+        except OSError as e:
+            hint = ""
+            if sys.platform.startswith("linux"):
+                hint = "\nAllow it with: sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'"
+            sys.exit("linewatch: cannot open an ICMP socket (%s).%s" % (e, hint))
+        self.sock.setblocking(False)
+        self.token = token & 0xFFFF  # tells our replies apart from other programs' pings
+        self.sent = {}
+
+    def send(self, ip, rnd):
+        payload = MAGIC + struct.pack("!HQ", self.token, rnd) + bytes(22)
+        pkt = struct.pack("!BBHHH", 8, 0, 0, self.token, rnd & 0xFFFF) + payload
+        pkt = pkt[:2] + struct.pack("!H", icmp_checksum(pkt)) + pkt[4:]
+        self.sent[(ip, rnd)] = time.monotonic_ns()
+        try:
+            self.sock.sendto(pkt, (ip, 0))
+            return True
+        except OSError:
+            self.sent.pop((ip, rnd), None)
+            return False
+
+    def wait(self, timeout):
+        out = []
+        try:
+            ready, _, _ = select.select([self.sock], [], [], max(0.0, timeout))
+        except InterruptedError:
+            ready = []
+        while ready:
+            try:
+                data, addr = self.sock.recvfrom(4096)
+            except OSError:  # includes BlockingIOError: nothing left to read
+                break
+            t = time.monotonic_ns()
+            if data and data[0] >> 4 == 4:  # macOS includes the IP header
+                data = data[(data[0] & 0x0F) * 4:]
+            if len(data) < 22 or data[0] != 0 or data[8:12] != MAGIC:
+                continue
+            token, rnd = struct.unpack("!HQ", data[12:22])
+            t0 = self.sent.pop((addr[0], rnd), None) if token == self.token else None
+            if t0 is not None:
+                out.append((addr[0], rnd, (t - t0) / 1e6))
+        if len(self.sent) > 5000:  # forget requests that never got a reply
+            cutoff = time.monotonic_ns() - 120 * 10 ** 9
+            self.sent = {k: v for k, v in self.sent.items() if v > cutoff}
+        return out
+
+
+class WinPinger(PingerBase):
+    """Windows: IcmpSendEcho from iphlpapi.dll (no admin rights). Each request runs in a
+    worker thread so several can be in flight at once."""
+
+    def __init__(self, token, timeout_s, workers=64):
+        import ctypes
+        import queue
+        import threading
+        self.ctypes, self.queue = ctypes, queue
+        lib = ctypes.WinDLL("iphlpapi.dll")
+        lib.IcmpCreateFile.restype = ctypes.c_void_p
+        lib.IcmpCreateFile.argtypes = []
+        lib.IcmpSendEcho.restype = ctypes.c_ulong
+        lib.IcmpSendEcho.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ushort,
+                                     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
+        self.lib = lib
+        self.invalid = ctypes.c_void_p(-1).value
+        self.timeout_ms = max(1, int(timeout_s * 1000))
+        self.payload = MAGIC + struct.pack("!HQ", token & 0xFFFF, 0) + bytes(22)
+        self.jobs = queue.Queue()
+        self.results = queue.Queue()
+        for _ in range(workers):
+            threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        ct = self.ctypes
+        handle = self.lib.IcmpCreateFile()
+        if not handle or handle == self.invalid:
+            return
+        req = ct.create_string_buffer(self.payload, len(self.payload))
+        reply = ct.create_string_buffer(1024)
+        while True:
+            ip, rnd = self.jobs.get()
+            try:
+                addr = struct.unpack("=L", socket.inet_aton(ip))[0]
+                t0 = time.monotonic_ns()
+                n = self.lib.IcmpSendEcho(handle, addr, req, len(self.payload), None,
+                                          reply, len(reply), self.timeout_ms)
+                t1 = time.monotonic_ns()
+                if n:
+                    src, status = struct.unpack_from("=LL", reply.raw, 0)
+                    if status == 0 and src == addr:  # 0 = IP_SUCCESS
+                        self.results.put((ip, rnd, (t1 - t0) / 1e6))
+            except Exception:
+                pass
+
+    def send(self, ip, rnd):
+        self.jobs.put((ip, rnd))
+        return True
+
+    def wait(self, timeout):
+        out = []
+        try:
+            out.append(self.results.get(timeout=max(0.001, timeout)))
+        except self.queue.Empty:
+            return out
+        while True:
+            try:
+                out.append(self.results.get_nowait())
+            except self.queue.Empty:
+                return out
+
+
+def make_pinger(token, timeout_s):
+    return WinPinger(token, timeout_s) if WINDOWS else SocketPinger(token)
 
 
 # --------------------------------------------------------------------------- network discovery
 
+def parse_route_print(text):
+    """Windows `route print -4 0.0.0.0`: the gateway of the lowest-metric default route."""
+    best = None
+    for line in text.splitlines():
+        p = line.split()
+        if len(p) >= 5 and p[0] == "0.0.0.0" and p[1] == "0.0.0.0" and is_ipv4(p[2]):
+            metric = int(p[4]) if p[4].isdigit() else 1 << 30
+            if best is None or metric < best[0]:
+                best = (metric, p[2])
+    return best[1] if best else None
+
+
 def default_gateway():
-    try:
-        best = None
-        with open("/proc/net/route") as f:
-            for line in list(f)[1:]:
-                p = line.split()
-                flags = int(p[3], 16)
-                if p[1] == "00000000" and flags & 0x1 and flags & 0x2:
-                    metric = int(p[6])
-                    gw = socket.inet_ntoa(struct.pack("<L", int(p[2], 16)))
-                    if best is None or metric < best[0]:
-                        best = (metric, gw)
-        if best:
-            return best[1]
-    except (OSError, ValueError, IndexError):
-        pass
-    if shutil.which("route"):  # macOS / BSD
+    if WINDOWS:
+        return parse_route_print(run_cmd(["route", "print", "-4", "0.0.0.0"]))
+    if os.path.exists("/proc/net/route"):  # Linux
         try:
-            out = subprocess.run(["route", "-n", "get", "default"], capture_output=True,
-                                 text=True, timeout=10).stdout
-            m = re.search(r"gateway:\s*(\d{1,3}(?:\.\d{1,3}){3})\b", out)
-            if m:
-                return m.group(1)
-        except (subprocess.SubprocessError, OSError):
-            pass
-    return None
+            best = None
+            with open("/proc/net/route") as f:
+                for line in list(f)[1:]:
+                    p = line.split()
+                    flags = int(p[3], 16)
+                    if p[1] == "00000000" and flags & 0x1 and flags & 0x2:
+                        metric = int(p[6])
+                        gw = socket.inet_ntoa(struct.pack("<L", int(p[2], 16)))
+                        if best is None or metric < best[0]:
+                            best = (metric, gw)
+            return best[1] if best else None
+        except (OSError, ValueError, IndexError):
+            return None
+    m = re.search(r"gateway:\s*(" + IPV4 + r")\b", run_cmd(["route", "-n", "get", "default"]))  # macOS
+    return m.group(1) if m else None
 
 
 def vpn_warning(gw, target):
     """Linux: warn when traffic to `target` would not leave through the router."""
-    if not shutil.which("ip"):
+    if WINDOWS or not shutil.which("ip"):
         return None
-    try:
-        out = subprocess.run(["ip", "route", "get", target], capture_output=True,
-                             text=True, timeout=10).stdout
-    except (subprocess.SubprocessError, OSError):
-        return None
+    out = run_cmd(["ip", "route", "get", target])
     if out and ("via %s " % gw) not in out:
         return ("WARNING: traffic to %s does not go through the router %s (%s). "
                 "A VPN is probably active; results will not describe your line."
@@ -188,24 +365,26 @@ def vpn_warning(gw, target):
 
 
 def trace(target, maxhops=8):
-    if shutil.which("tracepath"):
+    if WINDOWS:
+        cmd = ["tracert", "-d", "-h", str(maxhops), "-w", "1000", target]
+    elif shutil.which("tracepath"):
         cmd = ["tracepath", "-n", "-m", str(maxhops), target]
     elif shutil.which("traceroute"):
         cmd = ["traceroute", "-n", "-q", "1", "-w", "1", "-m", str(maxhops), target]
     else:
         return None
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=120).stdout
-    except (subprocess.SubprocessError, OSError):
-        return None
+    return run_cmd(cmd, timeout=120) or None
 
 
 def path_ips(text):
+    """Hop addresses, in order, from tracepath / traceroute / tracert output."""
     ips = []
     for line in (text or "").splitlines():
-        m = re.match(r"\s*\d+\??:?\s+(\d{1,3}(?:\.\d{1,3}){3})\b", line)
-        if m and m.group(1) not in ips:
-            ips.append(m.group(1))
+        if not re.match(r"\s*\d+\??:?\s", line):
+            continue
+        found = [x for x in re.findall(r"(?<![\d.])" + IPV4 + r"(?![\d.])", line) if is_ipv4(x)]
+        if found and found[-1] not in ips:
+            ips.append(found[-1])
     return ips
 
 
@@ -220,17 +399,6 @@ def detect_hop(prober, gw, target):
     return None, text
 
 
-def ntp_status():
-    if shutil.which("timedatectl"):
-        try:
-            v = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
-                               capture_output=True, text=True, timeout=10).stdout.strip()
-            return v or "unknown"
-        except (subprocess.SubprocessError, OSError):
-            pass
-    return "unknown"
-
-
 # --------------------------------------------------------------------------- data
 
 class Target:
@@ -239,13 +407,12 @@ class Target:
 
 
 class Round:
-    __slots__ = ("n", "t_wall", "t_mono_ns", "sent_ns", "rtt", "settle", "cls")
+    __slots__ = ("n", "t_wall", "t_mono_ns", "rtt", "settle", "cls")
 
     def __init__(self, n, t_wall, t_mono_ns, names, settle=False):
         self.n = n
         self.t_wall = t_wall
         self.t_mono_ns = t_mono_ns
-        self.sent_ns = {}
         self.rtt = {name: None for name in names}  # ms, or None = lost
         self.settle = settle
         self.cls = None
@@ -420,7 +587,7 @@ class Output:
         return os.path.join(self.dir, name)
 
     def append(self, name, text, echo=True):
-        with open(self.path(name), "a") as f:
+        with open(self.path(name), "a", encoding="utf-8") as f:
             f.write(text.rstrip("\n") + "\n")
         if echo:
             print(text, flush=True)
@@ -428,7 +595,7 @@ class Output:
     def csv_row(self, name, header, row):
         p = self.path(name)
         new = not os.path.exists(p) or os.path.getsize(p) == 0
-        with open(p, "a", newline="") as f:
+        with open(p, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if new:
                 w.writerow(header)
@@ -473,7 +640,7 @@ def write_event(out, ev, targets, args):
         mark = ">> " if id(r) in core_ids else "   "
         lines.append(mark + "%-29s %-15.3f " % (local_iso(r.t_wall), r.t_wall)
                      + "".join(cell(r.rtt.get(n)).ljust(w) for n, w in zip(names, widths)) + (r.cls or ""))
-    with open(out.path(receipt), "w") as f:
+    with open(out.path(receipt), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
     def frac(role):
@@ -567,23 +734,50 @@ def resolve_targets(args, out, prober, gw=None):
     return gw, hop, how
 
 
+def check():
+    """One-shot test: find the router, ping it and 1.1.1.1, report the clock offset."""
+    print("linewatch %s on %s, Python %s" % (VERSION, platform.platform(), platform.python_version()))
+    pinger = make_pinger(os.getpid(), 3.0)
+    gw = default_gateway()
+    print("router (default gateway): %s" % (gw or "NOT FOUND"))
+    ok = gw is not None
+    for name, ip in (("router", gw), ("internet", "1.1.1.1")):
+        if ip:
+            good = pinger.probe(ip, tries=3, wait=3.0)
+            print("ping %-8s %-15s %s" % (name, ip, "ok" if good else "NO REPLY"))
+            ok = ok and good
+    print("clock: %s" % describe_offset(clock_offset()))
+    print("RESULT: %s" % ("OK" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
 def run(args):
     out = Output(args.out)
-    prober = Pinger(os.getpid() ^ 0x5A5A)
-    pinger = Pinger(os.getpid())
+    lock = lock_file(out.dir)  # held until the process exits
+    if lock is None:
+        sys.exit("linewatch: already running with log folder %s" % out.dir)
+    stop_path = out.path(STOP_FILE)
+    if os.path.exists(stop_path):
+        os.remove(stop_path)
+    prober = make_pinger(os.getpid() ^ 0x5A5A, 2.0)
+    pinger = make_pinger(os.getpid(), args.timeout)
     stop = {"flag": False}
 
     def handle(signum, frame):
         stop["flag"] = True
 
-    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(s, handle)
+    for sig in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"):
+        if hasattr(signal, sig):
+            try:
+                signal.signal(getattr(signal, sig), handle)
+            except (OSError, ValueError):
+                pass
 
     gw, hop, how = resolve_targets(args, out, prober)
     targets = build_targets(gw, hop, args.internet)
-    out.note("linewatch %s started | %s | hop: %s | interval %gs timeout %gs stall %dms | clock NTP-synced: %s"
-             % (VERSION, ", ".join("%s %s" % (t.name, t.ip) for t in targets), how, args.interval,
-                args.timeout, args.stall_ms, ntp_status()))
+    out.note("linewatch %s started on %s | %s | hop: %s | interval %gs timeout %gs stall %dms | clock: %s"
+             % (VERSION, platform.system(), ", ".join("%s %s" % (t.name, t.ip) for t in targets), how,
+                args.interval, args.timeout, args.stall_ms, describe_offset(clock_offset())))
     warn = vpn_warning(gw, args.internet[0])
     if warn:
         out.note(warn)
@@ -613,11 +807,15 @@ def run(args):
     while not stop["flag"]:
         now = time.monotonic()
         if now >= next_tick:
+            if os.path.exists(stop_path):
+                out.note("stop requested (%s)" % STOP_FILE)
+                os.remove(stop_path)
+                break
             wall = time.time()
             jump = (wall - last_wall) - (now - last_mono)
             late = now - next_tick
             if jump > 3 or late > 5 * args.interval:
-                out.note("paused about %.0fs (suspend or scheduling stall); in-flight pings discarded"
+                out.note("paused about %.0fs (sleep or scheduling stall); in-flight pings discarded"
                          % max(jump, late))
                 pending.clear()
                 detector.flush()
@@ -650,22 +848,15 @@ def run(args):
             rnd += 1
             r = Round(rnd, wall, time.monotonic_ns(), [t.name for t in targets], settle=now < settle_until)
             for t in targets:
-                r.sent_ns[t.name] = time.monotonic_ns()
                 pinger.send(t.ip, rnd)
             pending[rnd] = r
             next_tick += args.interval
 
-        wait = max(0.0, min(next_tick - time.monotonic(), 0.5))
-        try:
-            ready, _, _ = select.select([pinger], [], [], wait)
-        except InterruptedError:
-            ready = []
-        if ready:
-            for src, n, t_ns in pinger.drain():
-                r = pending.get(n)
-                name = by_ip.get(src)
-                if r is not None and name in r.rtt and r.rtt[name] is None:
-                    r.rtt[name] = (t_ns - r.sent_ns[name]) / 1e6
+        for src, n, rtt in pinger.wait(max(0.0, min(next_tick - time.monotonic(), 0.5))):
+            r = pending.get(n)
+            name = by_ip.get(src)
+            if r is not None and name in r.rtt and r.rtt[name] is None:
+                r.rtt[name] = rtt
 
         cutoff = time.monotonic_ns() - int(args.timeout * 1e9)
         while pending:
@@ -677,6 +868,7 @@ def run(args):
     detector.flush()
     write_summary(out, stats, targets)
     out.note("linewatch stopped (pings from the last %gs were still in flight and are not counted)" % args.timeout)
+    unlock_file(lock)
 
 
 # --------------------------------------------------------------------------- compare
@@ -685,7 +877,7 @@ def load_events(d):
     p = os.path.join(d, "events.csv")
     if not os.path.exists(p):
         sys.exit("compare: no events.csv in %s" % d)
-    with open(p, newline="") as f:
+    with open(p, newline="", encoding="utf-8") as f:
         return [{"start": float(r["start_epoch"]), "end": float(r["end_epoch"]), "cls": r["class"],
                  "dur": r["duration_s"]} for r in csv.DictReader(f)]
 
@@ -694,7 +886,7 @@ def load_coverage(d):
     p = os.path.join(d, "summary.csv")
     if not os.path.exists(p):
         return []
-    with open(p, newline="") as f:
+    with open(p, newline="", encoding="utf-8") as f:
         return [(float(r["period_start_epoch"]), float(r["period_end_epoch"]))
                 for r in csv.DictReader(f) if int(r["rounds"] or 0) + int(r["settle_rounds"] or 0) > 0]
 
@@ -746,6 +938,8 @@ def main(argv=None):
                        help="only compare this event class (repeatable), e.g. --class line")
         compare(p.parse_args(argv[1:]))
         return
+    if argv and argv[0] == "check":
+        sys.exit(check())
     if argv and argv[0] == "run":
         argv = argv[1:]
     p = argparse.ArgumentParser(prog="linewatch.py", description=__doc__,

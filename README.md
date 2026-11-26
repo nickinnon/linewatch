@@ -4,54 +4,57 @@ Records internet dropouts and shows where each one started: your home network, y
 
 It pings 4 addresses once per second and writes nothing while the connection is healthy.
 
-## Requirements
+Works on Linux, macOS, and Windows. Needs no admin rights and nothing installed besides Python.
 
-- Linux. macOS is untested.
-- Python 3.8 or newer.
-- A wired connection with any VPN turned off. Otherwise the results describe the Wi-Fi or the VPN, not your line.
+## 1. Get Python 3.8 or newer
 
-Check that ping is allowed without root:
+| OS | How |
+|---|---|
+| Windows | Install from [python.org](https://www.python.org/downloads/). Use `py` in every command below. |
+| macOS | Run `python3 --version` in Terminal. If it offers to install developer tools, accept. |
+| Linux | Usually already installed. Check with `python3 --version`. |
+
+## 2. Get linewatch
+
+Download and unzip [linewatch-main.zip](https://github.com/nickinnon/linewatch/archive/refs/heads/main.zip), or run:
 
 ```
-cat /proc/sys/net/ipv4/ping_group_range
+git clone https://github.com/nickinnon/linewatch
 ```
 
-If it prints `1 0`, run:
+Open a terminal (Windows: Command Prompt) in that folder.
+
+## 3. Test
+
+| Linux / macOS | Windows |
+|---|---|
+| `python3 linewatch.py check` | `py linewatch.py check` |
+
+It must end with `RESULT: OK`.
+
+If it fails on Linux with `cannot open an ICMP socket`, run this and then test again:
 
 ```
 sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'
 ```
 
-## Run
+## 4. Run
 
-```
-git clone https://github.com/nickinnon/linewatch
-cd linewatch
-python3 linewatch.py
-```
+Use a wired connection and turn off any VPN. Otherwise the results describe the Wi-Fi or the VPN, not your line.
 
-Press Ctrl+C to stop. Logs go to `~/linewatch-logs/`.
+| | Linux / macOS | Windows |
+|---|---|---|
+| Run in this window (Ctrl+C stops it) | `python3 linewatch.py` | `py linewatch.py` |
+| Start automatically at every login | `python3 install.py` | `py install.py` |
+| Remove the automatic start | `python3 install.py --uninstall` | `py install.py --uninstall` |
 
-## Run in the background (Linux)
+Logs go to the `linewatch-logs` folder in your home folder (Windows: `C:\Users\<you>\linewatch-logs`). Uninstalling keeps them.
 
-This starts linewatch automatically every time you log in.
-
-```
-./install.sh
-```
-
-| To | Run |
-|---|---|
-| Check it's running | `systemctl --user status linewatch` |
-| Watch it live | `journalctl --user -fu linewatch` |
-| Stop it | `systemctl --user stop linewatch` |
-| Uninstall | `systemctl --user disable --now linewatch && rm ~/.local/bin/linewatch.py ~/.config/systemd/user/linewatch.service` |
-
-Options go after `install.sh`, for example: `./install.sh --hop 203.0.113.1`
+Options go after the command, for example: `python3 install.py --hop 203.0.113.1`
 
 ## Results
 
-`~/linewatch-logs/events.log` gets one line per dropout. If it's empty or missing, there were no dropouts.
+`linewatch-logs/events.log` gets one line per dropout. If it's empty or missing, there were no dropouts.
 
 | Class | Where the fault is |
 |---|---|
@@ -63,7 +66,7 @@ Options go after `install.sh`, for example: `./install.sh --hop 203.0.113.1`
 The other files:
 
 - `receipts/` holds one file per dropout, with every ping from 60 s before it to 30 s after.
-- `summary.log` gets a line every 15 minutes with loss percentages. These lines also show the monitor was running.
+- `summary.log` gets a line every 15 minutes with loss percentages. These lines also show the monitor was running. Each start also records how far the computer's clock is off.
 
 ## Compare two homes
 
@@ -91,6 +94,11 @@ For every option: `python3 linewatch.py --help`
 ## Privacy
 
 The logs contain your router's local IP, the ISP hop's IP, and timestamps. They don't contain your public IP, MAC addresses, or hostnames.
+
+## Tested on
+
+- Linux: tested.
+- macOS, Windows: not tested yet. If `check` fails, open an issue and paste its output.
 
 ## Tests
 
