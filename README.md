@@ -1,102 +1,103 @@
 # linewatch
 
-A small connection monitor for intermittent outages. Typical symptoms: video calls freeze for a few seconds, games stall, pages hang, and then everything recovers before anyone can look at it.
+Records internet dropouts and shows where each one started: your home network, your ISP's line, or beyond.
 
-Once per second, linewatch pings four targets:
-
-| target | default | what a failure here means |
-|---|---|---|
-| `router` | your default gateway | the problem is inside your home network |
-| `hop` | first public ISP router that answers ping | (used to tell the next two classes apart) |
-| `cloudflare` | 1.1.1.1 | the internet is unreachable... |
-| `google` | 8.8.8.8 | ...when both of these fail together |
-
-It records nothing while the connection is healthy. When a disruption happens, it writes one line to `events.log` and `events.csv`, plus a receipt containing every ping from a minute before to 30 seconds after. It labels each event by where the disruption starts:
-
-| class | what failed | where the fault is |
-|---|---|---|
-| **line** | ISP hop and internet together, router fine | modem, coax/cable plant, or ISP access network |
-| **upstream** | internet only; router and ISP hop fine | past the first ISP hop |
-| **lan** | router and internet together | inside the home |
-| **wan** | internet only; no ISP hop configured | somewhere past your router |
-
-A target counts as failed for a round if its reply is lost, or if it arrives later than 1 second. During many cable dropouts, packets are queued for a few seconds and then released all at once, so the late replies count as part of the outage.
-
-Some loss is noise and never raises an event. It is only counted in the 15-minute summaries:
-
-- **hop-only** / **router-only**: routers give low priority to pings addressed to themselves. Loss at a hop that doesn't continue to the destination isn't real loss.
-- **single**: only one internet destination failed. The problem is at that destination, not your line.
+It pings 4 addresses once per second and writes nothing while the connection is healthy.
 
 ## Requirements
 
-- Python 3.8+ (standard library only). No root is needed: it uses unprivileged ICMP sockets.
-- Linux: these are allowed by default on most distributions. Check with `cat /proc/sys/net/ipv4/ping_group_range`. If it prints `1 0`, run `sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'`.
-- macOS: should work, but it hasn't been tested there yet.
-- `tracepath` or `traceroute` (optional), for auto-detecting the ISP hop.
+- Linux. macOS is untested.
+- Python 3.8 or newer.
+- A wired connection with any VPN turned off. Otherwise the results describe the Wi-Fi or the VPN, not your line.
 
-## Run it
-
-```sh
-python3 linewatch.py run --out ~/linewatch-logs
-```
-
-Linux, as a background service that runs whenever you're logged in:
-
-```sh
-./install.sh --out ~/linewatch-logs
-journalctl --user -fu linewatch     # watch it
-```
-
-macOS: run it in a terminal tab or `tmux`. Use `caffeinate -i python3 linewatch.py run` to keep the machine from sleeping.
-
-### Options worth knowing
-
-- `--hop IP`: pin the ISP hop. By default it's auto-detected as the first public router on the path to 1.1.1.1 that answers ping. ISPs load-balance across parallel routers, though, so auto-detection can pick a different one on each start. **If you're comparing homes, pin the same hop everywhere.** Use `--hop none` to skip it.
-- `--internet 1.1.1.1,8.8.8.8`: the internet targets. A round counts as "internet down" only if all of them fail.
-- `--stall-ms 1000`, `--timeout 10`, `--interval 1`: the stall threshold, how long to wait for a reply, and the probe rate.
-- `--summary-every 900`: how often to write a summary line. These lines also prove the monitor was running.
-
-## Output
+Check that ping is allowed without root:
 
 ```
-~/linewatch-logs/
-  events.log      one line per event (human-readable)
-  events.csv      the same, machine-readable (epoch + UTC + local times)
-  receipts/       per-event raw data: every round's RTT per target, one minute before through 30 s after
-  summary.log     start/stop, VPN warnings, and a summary every 15 minutes (loss %, noise counts)
-  summary.csv     the same summaries; used as coverage by `compare`
-  paths.log       the traced path at each start (documents the topology and route changes)
+cat /proc/sys/net/ipv4/ping_group_range
 ```
 
-## Comparing two homes
+If it prints `1 0`, run:
 
-If two homes on the same street or building see their outages at the same moments, the cause is shared infrastructure, not anyone's modem. To check:
-
-1. Run linewatch in both homes with **the same `--hop`**, on wired machines, with NTP enabled. Check NTP with `timedatectl` on Linux.
-2. Swap log folders (zip them), then run:
-
-```sh
-python3 linewatch.py compare ~/linewatch-logs ./neighbor-logs --window 5 --class line
+```
+sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'
 ```
 
-Each event comes back as one of:
-- **MATCH**: the other home had an event within ±5 s.
-- **no match (other was monitoring)**: a real negative.
-- **unknown**: the other monitor wasn't running at that time.
+## Run
 
-## Tips
+```
+git clone https://github.com/nickinnon/linewatch
+cd linewatch
+python3 linewatch.py
+```
 
-- **Use a wired machine.** On Wi-Fi, events still show up, but they're classed `lan` whenever the Wi-Fi itself drops.
-- **Turn off any VPN** (Cloudflare WARP, corporate VPNs), or the internet pings go through the tunnel. On Linux, linewatch warns about this in `summary.log`.
-- **Suspend and resume are handled.** In-flight pings are discarded, and the first 30 s after start, resume, or a network change are ignored.
-- **Privacy.** The logs contain your router's LAN address, the ISP hop's address, and timestamps. They don't contain your public IP, MAC addresses, or hostnames. The timestamps do show when the machine was on.
+Press Ctrl+C to stop. Logs go to `~/linewatch-logs/`.
+
+## Run in the background (Linux)
+
+This starts linewatch automatically every time you log in.
+
+```
+./install.sh
+```
+
+| To | Run |
+|---|---|
+| Check it's running | `systemctl --user status linewatch` |
+| Watch it live | `journalctl --user -fu linewatch` |
+| Stop it | `systemctl --user stop linewatch` |
+| Uninstall | `systemctl --user disable --now linewatch && rm ~/.local/bin/linewatch.py ~/.config/systemd/user/linewatch.service` |
+
+Options go after `install.sh`, for example: `./install.sh --hop 203.0.113.1`
+
+## Results
+
+`~/linewatch-logs/events.log` gets one line per dropout. If it's empty or missing, there were no dropouts.
+
+| Class | Where the fault is |
+|---|---|
+| `line` | Between your router and the ISP hop: your modem, the cabling, or ISP equipment |
+| `upstream` | Past the ISP hop |
+| `lan` | Inside your home network |
+| `wan` | Past your router (shown when no ISP hop is set) |
+
+The other files:
+
+- `receipts/` holds one file per dropout, with every ping from 60 s before it to 30 s after.
+- `summary.log` gets a line every 15 minutes with loss percentages. These lines also show the monitor was running.
+
+## Compare two homes
+
+1. Run linewatch in both homes with the same `--hop`.
+2. Copy the other home's log folder to your computer.
+3. Run:
+
+```
+python3 linewatch.py compare ~/linewatch-logs ./other-home-logs
+```
+
+`MATCH` means both homes dropped within 5 seconds of each other, which points to shared wiring or equipment.
+
+## Options
+
+| Option | Default | What it does |
+|---|---|---|
+| `--out DIR` | `~/linewatch-logs` | Where logs are written |
+| `--hop IP` | auto | The ISP router to ping. Auto-detect can pick a different router each run, so set it explicitly when comparing homes. Use `none` to skip it. |
+| `--internet IPs` | `1.1.1.1,8.8.8.8` | Internet addresses to ping |
+| `--stall-ms N` | `1000` | A reply slower than this counts as a failure |
+
+For every option: `python3 linewatch.py --help`
+
+## Privacy
+
+The logs contain your router's local IP, the ISP hop's IP, and timestamps. They don't contain your public IP, MAC addresses, or hostnames.
 
 ## Tests
 
-```sh
-python3 -m unittest discover -s tests -v
+```
+python3 -m unittest discover -s tests
 ```
 
 ## License
 
-MIT. See `LICENSE`.
+MIT
